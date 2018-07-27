@@ -1,0 +1,354 @@
+---
+title: "Undo Data Suppression"
+author: "Matt Moehr"
+date: "Thursday, April 19, 2018"
+output:
+  html_document:
+    keep_md: yes
+---
+
+# Intro
+
+A lot of data has suppression techniques applied due to small populations.
+
+We often have values in the margins of the table but not in the individual table cells. This usually occurs with geographic areas. For example, we could have data on the state but not on the individual counties. It can also occur with categorical variables like age group. In the case of having the overall unemployment rate within a county but not having the unemployment rate broken down by age groups.
+
+We can think of the usual case where these two situations occur together: we want to know the unemployment rate by age-groups within each county; however, we only have data on the total unemployment rate in each county and the unemployment rates for each age-group within the state as a whole.
+
+There are three additional things to consider:
+
+1. We may have some of the cells of the table. For example, the CDC often publishes data, such as infant mortality rates, on counties within urban areas but not on every county.
+2. We may have extra covariates that are known to correlate well with the piece of data we are interested in. For example, we may know average education levels within each county and that is (weakly) predictive of the unemployment rate.
+3. Even the data we have -- in this example the marginal unemployment rates -- might be measured with error. Therefore, the given data might have confidence intervals or standard errors.
+
+This vignette will use iterative proportional fitting to un-supperess the cells of a table. I will demonstrate what to do under the first consideration -- having some cell values -- but leave the 2nd and 3rd issues for the advanced vignette.
+
+First I will make a toy-data example to show the maths.
+
+Then I will use infant, child, and adult mortality rate data from the CDC to demonstrate the more complicated example.
+
+# R setup
+
+As usual with R, there are multiple packages that do almost exactly the same thing. I chose to use the `mipfp` package instead of `ipfp` because it makes more sense to me. See [this subsection](https://spatial-microsim-book.robinlovelace.net/smsimr.html#compareipf) of a e book about spatial microsimulation for a brief comparison of the performance of the two packages.
+
+```{r setup}
+# data manipulation stuff
+library(tidyverse)
+
+# iterative proportional fitting
+library(mipfp)
+
+# I re-wrote the main fitting function to accomadate the situation of
+# having some cells within the table fixed to values.
+source("code/ipfp_fixed_cells.R")
+
+# integerization functions
+# download from https://github.com/Robinlovelace/spatial-microsim-book
+source("code/spatial-microsim-book-functions.R")
+```
+
+# First Example
+
+## Make data
+
+We are calling this the "toy" data. I made up all the numbers.
+
+```{r toy-data}
+s = rep( c('Alaska', 
+           'Nebraska', 
+           'Tennessee', 
+           'Wisconsin'
+           ),
+         5)
+
+
+toy <- data_frame(place = s,
+                  age   = rep(1:5, 4),
+                  incidents = c( 15, 9, 10, 7, 1,
+                                 35, 28, 21, 14, 2,
+                                 45, 20, 15, 19, 1,
+                                 50, 25, 20, 25, 0
+                                 ),
+                  population = c( 2000, 5600, 3400, 1000, 3000,
+                                  2333, 2599, 3602, 1901, 3550,
+                                  2277, 2209, 4200, 1764, 7000,
+                                  2097, 2001, 4104, 1987, 6400
+                                  )
+                  )
+
+toy = mutate(toy, rate = incidents / population)
+                                    
+str(toy)
+print(toy)
+
+## heres the 2-way table
+toy_tbl <- toy %>% 
+             select(place, age, incidents) %>%
+             spread(age, incidents)
+```
+
+At this point we need to find a good way to make the "marginal" sums for incidents and population by both place and age. Whatever approach we use should generalize to any table with 2 factors (e.g. place and age) and any two variables used for the numerator (incidents) and denominator (population).
+
+**TODO** Figure out a smart way to integrate tidy data principles with the list objects and arrays that the functions expect. The idea of "marginals" seems antithetical to Tidy data, so let's just make separate data frames for each of the marginals.
+
+```{r create-marginals}
+
+place_marginals <- toy %>%
+                     group_by(place) %>%
+                     summarise(incidents = sum(incidents),
+                               population = sum(population)
+                               )
+
+place_marginals$rate <- place_marginals$incidents / place_marginals$population
+
+
+age_marginals <- toy %>%
+                   group_by(age) %>%
+                   summarise(incidents = sum(incidents),
+                             population = sum(population)
+                             )
+
+age_marginals$rate <- age_marginals$incidents / age_marginals$population
+             
+```
+
+## Suppress data
+
+We throw out some data. In the future this could be improved by coming up with a way to suppress the "smallest" counts/values, but the IPF methods are the same. I picked which cells to suppress.
+
+```{r suppress-data}
+
+selected_cells <- rbind(c("Alaska", 3),
+                        c("Alaska", 4),
+                        c("Alaska", 5),
+                        c("Nebraska", 1),
+                        c("Nebraska", 2),
+                        c("Nebraska", 3),
+                        c("Nebraska", 5),
+                        c("Tennessee", 1),
+                        c("Wisconsin", 2)
+                        )
+
+# for loops make me nervous so make edits on a copy
+foo <- toy
+
+for ( i in 1:nrow(foo) ) {
+  for ( j in 1:nrow(selected_cells) ) {
+    if ( foo[i,1] == selected_cells[j,1] & foo[i,2] == selected_cells[j,2] ){
+      foo[i,"incidents"] <- NaN
+      foo[i,"rate"] <- NaN
+    }
+  } 
+}
+
+toy_suppressed <- foo
+print(toy_suppressed)
+```
+
+## Unsuppress data
+
+The `mipfp` package doesn't know how to deal with the situation where some of the cells still have data, so we use a two stage approach to unsuppress the specified cells.
+
+To deal with this I altered the code in the `mipfp::Ipfp()` function by changing two things:
+
+1. Each iteration of IPF uses an "update factor" that gets multiplied through the matrix - first by row and then by columns. The update factor is calculated as the ratio fo the target marginals divided by the sum of the row/column from the previous iteration. (For the fist iteration, the sum is across the row/column of the seed matrix.) Obviously what we need to do is "remove" the fixed cells when the algorithm calculates the update factor. It's a bit of arithmetic, but straightforward in the code. 
+2. Second, after the algorithm multiplies its update factors, we need to reset the fixed cells to there fixed values. This means that as the algorithm goes to start the next iteration, the fixed cells will be reset back to their original values and are thus not iteratively "raked" to the margins.
+
+```{r unsuppress-data}
+
+## convert the suppressed data into a matrix format because that's what Ipfp() wants
+toy_suppressed_tbl <- toy_suppressed %>% 
+                        select(place, age, incidents) %>%
+                        spread(age, incidents)
+
+toy_suppressed_mat <- as.matrix(toy_suppressed_tbl[,-1])
+
+## TODO double check and then delete this _mat_zeros thing?
+## eventually we'll need a version of the matrix with zeros instead of NaN
+## so we might as well create that now
+## toy_suppressed_mat_zeros <- toy_suppressed_mat
+## toy_suppressed_mat_zeros[is.na(toy_suppressed_mat)] <- 0
+
+## make a matrix of all 1s with same dimensions as the toy data
+## this is the worst possible seed matrix so we are testing with it first
+toy_seed <- array(data = 1,
+                  dim = c(nrow(toy_suppressed_mat),
+                          ncol(toy_suppressed_mat)
+                          )
+                  )
+
+##############################################################################
+## TODO after I run the real data and it works ok, we can get rid of this
+## experimentation with the seed matrix?
+## let us try to make a better seed
+remainder <- sum(place_marginals$incidents) - sum(toy_suppressed_mat, na.rm = TRUE)
+toy_seed_2 <- as.array(toy_suppressed_mat)
+
+default_seed <- remainder / sum(is.na(toy_seed_2))
+
+## the algo wants to add up from below it seems so the seed should under
+## guess the values across the board
+seed_constant <- 2
+
+toy_seed_2[is.na(toy_seed_2)] <- default_seed - seed_constant
+
+##############################################################################
+
+## the marginals go in a list for Ipfp()
+toy_target <- list(as.array(place_marginals$incidents),
+                   as.array(age_marginals$incidents)
+                   )
+
+## this tells the Ipfp() function which is rows and which is columns
+toy_target_design <- list(1,2)
+
+toy_result_no_fix <- Ipfp(toy_seed,
+                          toy_target_design,
+                          toy_target,
+                          print = TRUE
+                          )
+
+## here are the error RATES
+round(( toy_result_no_fix$x.hat - toy_tbl[,-1] ) / toy_tbl[,-1],
+      2
+      )
+## those are crazy big errors. 
+
+## my function expects this matrix to have values where the cells should
+## be fixed. for cells that are allowed to change, they will have NaN's.
+## Ipfp() uses arrays and lists so I guess keep using arrays?
+fixed_cells = array(data = toy_suppressed_mat,
+                    dim = dim(toy_suppressed_mat)
+                    )
+
+
+toy_result_fixed <- ipfp_fixed_cells(toy_seed,
+                                     toy_target_design,
+                                     toy_target,
+                                     fixed_cells,
+                                     print = TRUE
+                                     )
+
+## and now we have almost no error rates:
+round(( toy_result_fixed$x.hat - toy_tbl[,-1] ) / toy_tbl[,-1],
+      2
+      )
+
+toy_unsuppressed_mat <- toy_result_fixed$x.hat
+
+## these should be equal
+all.equal(sum(place_marginals$incidents), sum(toy_unsuppressed_mat))
+                     
+## if you dont like the idea of fractional people (or whatever) then you
+## can integerize the result but the integerization may make the overall 
+## total no longer correct
+toy_unsuppressed_mat_int <- int_trs(toy_unsuppressed_mat)
+
+## in this case they are still true which means that the integerization
+## algorithm did not encounter any ties
+all.equal(sum(place_marginals$incidents), sum(toy_unsuppressed_mat_int))
+
+```
+
+
+# Second Example
+
+This is where all my work started. The CDC suppresses the death count in their mortality data any time the cell is less than 10. So when you divide up by age groups (0-1, 2-4, 5-9, etc.) and counties you get a lot of suppressed data. However, you can get counts across all counties (ie at the state-level) and across all ages. Thus we need to the IPF in order to unsuppress the mortality counts...
+
+## Data prep
+
+The data comes in from tab-separated files that I downloaded from CDC wonder. The files have a number of quircks, so we put the loading scripts in a separate file. The end result will be three tibles:
+
+* `age_raw` - is the marginals for age across all counties in the state of Minnesota.
+* `county_raw` - is the marginals for counties across all age groups.
+* `county_age_raw` - is the two-way table of age-groups by counties. This is the table that we want to unsuppress.
+
+```{r cdc-data-prep, include=FALSE}
+## data can be downloaded from https://wonder.cdc.gov/cmf-icd10.html
+
+## import csv files
+## calculate marginals
+source("code/import_cdc_data.R")
+```
+
+## Set up the objects for ipfp
+
+```{r cdc-data-munge}
+
+## drop the labels and convert to a matrix
+cdc_tbl <- county_age_raw %>%
+             select(County, age_group, deaths_num) %>%
+             spread(age_group, deaths_num)
+
+cdc_mat <- as.matrix(cdc_tbl[, -1])
+
+
+## seed of all 1s; the worst possible seed
+cdc_seed <- array(data = 1,
+                  dim = c(nrow(cdc_mat),
+                          ncol(cdc_mat)
+                          )
+                  )
+
+## just tells the function which order to expect the rows/cols
+cdc_target_design <- list(1,2)
+
+## these are the marginals
+
+as.array( as.matrix(age_raw[, c("age_group", "deaths_num")]) )
+as.array( as.matrix(county_raw[, c("County", "deaths_num")]) )
+
+cdc_target <- list(as.array(county_raw$deaths_num),
+                   as.array(age_raw$deaths_num)
+                   )
+
+## my function expects this matrix to have values where the cells should
+## be fixed. for cells that are allowed to change, they will have NaN's.
+## Ipfp() uses arrays and lists so I guess keep using arrays?
+# fixed_cells = array(data = toy_suppressed_mat,
+#                     dim = dim(toy_suppressed_mat)
+#                     )
+cdc_fixed <- array(data = cdc_mat,
+                   dim = dim(cdc_mat)
+                   )
+
+## run the iterative proportional fitting function
+# toy_result_fixed <- ipfp_fixed_cells(toy_seed,
+#                                      toy_target_design,
+#                                      toy_target,
+#                                      fixed_cells,
+#                                      print = TRUE
+#                                      )
+cdc_result <- ipfp_fixed_cells(cdc_seed,
+                               cdc_target_design,
+                               cdc_target,
+                               cdc_fixed,
+                               print = TRUE
+                               )
+
+result2 <- Ipfp(cdc_seed,
+                cdc_target_design,
+                cdc_target,
+                print = TRUE
+                )
+
+
+source('C:/Users/pwmxm01/Desktop/IPF/IPF/Functions/ipf2df.txt')
+
+result3 <- ipf2(county_raw$deaths_num,
+                c(age_raw$deaths_num[1:12], age_raw$deaths_num[13] + 1),
+                cdc_seed
+                )
+
+## check error rates:
+round(( result2$x.hat - cdc_mat ) / cdc_mat,
+      4
+      )
+
+round(( result3$fitted.table - cdc_mat ) / cdc_mat,
+      4
+      )
+
+```
+
+
